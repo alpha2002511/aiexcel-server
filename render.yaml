@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: excel-data-assistant-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -c gunicorn.conf.py main:app
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: https://excel-data-assistant.vercel.app,http://localhost:5173
+      - key: MAX_FILE_SIZE
+        value: 52428800
+      - key: RATE_LIMIT_PER_MINUTE
+        value: 30
+      - key: DATABASE_URL
+        value: /tmp/data.db
