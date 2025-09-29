@@ -4,7 +4,7 @@ import pandas as pd
 import sqlite3
 import os
 import json
-from typing import Dict, Any
+from typing import Dict, Any, List
 import google.generativeai as genai
 from dotenv import load_dotenv
 
@@ -24,6 +24,102 @@ app.add_middleware(
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel('gemini-2.5-flash')
+
+def _get_generation_config():
+    return {
+        "temperature": float(os.getenv("GEN_TEMPERATURE", "0.2")),
+        "top_p": float(os.getenv("GEN_TOP_P", "0.9")),
+        "top_k": int(os.getenv("GEN_TOP_K", "40")),
+        "max_output_tokens": int(os.getenv("GEN_MAX_TOKENS", "512")),
+    }
+
+SAFE_SQL_PREFIX = "SELECT"
+MAX_ROWS = int(os.getenv("MAX_ROWS", "50"))
+
+
+def _build_classification_prompt(user_question: str) -> str:
+    return f"""
+You are a helpful analyst. Classify the user's request strictly as one of two categories.
+
+Question: "{user_question}"
+
+Return EXACTLY one token: SQL or DESCRIBE.
+- Return SQL if the user is asking to compute values, filter rows, aggregate, sort, or otherwise needs data retrieved using a SELECT statement.
+- Return DESCRIBE if the user is asking about the structure, columns, ranges, freshness, or wants a narrative/overview insight.
+""".strip()
+
+
+def _build_sql_prompt(columns: List[str], user_question: str) -> str:
+    column_list = ", ".join(columns)
+    return f"""
+You convert natural language questions into a single SQLite SELECT statement over one table called user_data.
+
+Columns: {column_list}
+
+Rules:
+- Output ONLY the SQL, no commentary, no markdown fences.
+- Use ONLY these columns and ONLY the table user_data.
+- Do NOT write DDL/DML (no CREATE/UPDATE/DELETE/INSERT/DROP/ATTACH/PRAGMA).
+- If aggregating, include GROUP BY when needed.
+- Prefer explicit column names over * where possible.
+- Always limit the result to {MAX_ROWS} rows if it could return many rows.
+- Use double quotes around string literals only if required by SQLite; otherwise single quotes are fine.
+- If the question is ambiguous, make a reasonable assumption and proceed.
+
+Question: "{user_question}"
+SQL:
+""".strip()
+
+
+def _is_sql_safe(sql_query: str, columns: List[str]) -> bool:
+    sql_upper = sql_query.upper()
+    if not sql_upper.startswith(SAFE_SQL_PREFIX):
+        return False
+    forbidden = [
+        ";", "--", "/*", "*/", " PRAGMA ", " ATTACH ", " DETACH ",
+        " UPDATE ", " INSERT ", " DELETE ", " DROP ", " ALTER ", " CREATE ", " VACUUM ",
+    ]
+    if any(f in sql_upper for f in forbidden):
+        return False
+    # Ensure only known columns or '*' and basic SQL keywords are present
+    # Basic heuristic: if identifiers not in allowed set, reject
+    allowed_tokens = {c.upper() for c in columns}
+    allowed_tokens.update({"SELECT","FROM","WHERE","AND","OR","GROUP","BY","ORDER","LIMIT","ASC","DESC","COUNT","SUM","AVG","MIN","MAX","AS","LIKE","IN","NOT","BETWEEN","HAVING","DISTINCT","CASE","WHEN","THEN","ELSE","END","IS","NULL","ON" ,"INNER","LEFT","JOIN"})
+    # Very light check: split on non-alphanum/underscore
+    import re
+    tokens = [t for t in re.split(r"[^A-Z0-9_]+", sql_upper) if t]
+    unknown_identifiers = [t for t in tokens if t.isalpha() and t not in allowed_tokens and t != "USER_DATA" and not t.isnumeric()]
+    # Allow function names
+    allowed_funcs = {"COUNT","SUM","AVG","MIN","MAX"}
+    unknown_identifiers = [t for t in unknown_identifiers if t not in allowed_funcs]
+    return len(unknown_identifiers) == 0
+
+
+def _ensure_limit(sql_query: str, is_aggregate: bool) -> str:
+    if "LIMIT" in sql_query.upper() or is_aggregate:
+        return sql_query
+    return f"{sql_query} LIMIT {MAX_ROWS}"
+
+
+def _summarize_result(user_question: str, df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return "No rows matched the criteria."
+    # Build a compact, useful summary
+    max_preview_rows = 3
+    num_rows = len(df)
+    num_cols = len(df.columns)
+    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    parts = [
+        f"Returned {num_rows} rows and {num_cols} columns.",
+    ]
+    if numeric_cols:
+        desc = df[numeric_cols].describe().to_dict()
+        # keep only mean for brevity
+        means = {k: v.get("mean") for k, v in desc.items() if isinstance(v, dict) and "mean" in v}
+        if means:
+            parts.append(f"Key averages: {json.dumps(means, default=float)}")
+    parts.append(f"Preview: {df.head(max_preview_rows).to_dict('records')}")
+    return " ".join(parts)
 
 class DataProcessor:
     def __init__(self):
@@ -126,15 +222,7 @@ async def process_query(request: Dict[str, Any]):
             raise HTTPException(400, "No data uploaded yet")
         
         # Determine if question needs SQL or descriptive answer
-        classification_prompt = f"""
-        Question: "{user_question}"
-        
-        Does this question require:
-        A) A SQL query to get specific data (like counts, averages, filtering)
-        B) A descriptive explanation about the dataset structure/content
-        
-        Answer only 'SQL' or 'DESCRIBE'
-        """
+        classification_prompt = _build_classification_prompt(user_question)
         
         classification = model.generate_content(classification_prompt)
         query_type = classification.text.strip().upper()
@@ -159,19 +247,7 @@ async def process_query(request: Dict[str, Any]):
         
         else:
             # Generate and execute SQL query
-            sql_prompt = f"""
-            Table: user_data
-            Columns: {columns}
-            
-            Convert this question to a SQL SELECT query: "{user_question}"
-            
-            Rules:
-            - Return ONLY the SQL query
-            - Use proper column names from the list above
-            - Limit results to 50 rows max
-            
-            SQL:
-            """
+            sql_prompt = _build_sql_prompt(columns, user_question)
             
             response = model.generate_content(sql_prompt)
             sql_query = response.text.strip().replace('```sql', '').replace('```', '').strip()
