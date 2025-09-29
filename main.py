@@ -66,6 +66,14 @@ class DataProcessor:
 
 processor = DataProcessor()
 
+@app.get("/")
+async def root():
+    return {"message": "Excel Data Assistant API"}
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
 @app.get("/test-gemini")
 async def test_gemini():
     try:

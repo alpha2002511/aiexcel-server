@@ -9,7 +9,7 @@ import google.generativeai as genai
 
 app = FastAPI()
 
-allowed_origins = os.getenv("ALLOWED_ORIGINS", "https://your-vercel-app.vercel.app").split(",")
+allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,6 +61,10 @@ processor = DataProcessor()
 @app.get("/")
 async def root():
     return {"message": "Excel Data Assistant API"}
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
